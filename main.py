@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default=None, help='download dataset path')
     parser.add_argument('--data_type', type=str, default=None, help='type of dataset')
     parser.add_argument('--alpha_T',default=0.8 ,type=float, help='alpha_T')
+    parser.add_argument('--alpha_end_epoch', default=-1, type=int, help='epoch count for alpha_t schedule (default: same as end_epoch)')
+    parser.add_argument('--dynamic_alpha', action='store_true', help='use dynamic alpha_t = 1 - hist_acc/100 instead of fixed schedule')
     parser.add_argument('--saveckp_freq', default=299, type=int, help='Save checkpoint every x epochs. Last model saving set to 299')
     parser.add_argument('--rank', default=-1, type=int,help='node rank for distributed training')
     parser.add_argument('--world_size', default=1, type=int,help='number of distributed processes')
@@ -337,11 +339,14 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow(['epoch', 'lr', 'alpha_t',
                          'train_loss', 'train_top1', 'train_top5',
+                         'hist_acc', 'hist_entropy',
                          'val_top1', 'val_top5',
                          'val_b1_top1', 'val_b2_top1', 'val_b3_top1'])
 
+    last_hist_acc = -1  # 用于动态 α_t，-1 表示尚无历史
+
     for epoch in range(args.start_epoch, args.end_epoch):
-        
+
         # if args.tsne:
         out_list = []
         target_list = []
@@ -351,17 +356,26 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
             train_sampler.set_epoch(epoch)
 
         if args.HSKD:
-            if args.coeff_decay == 'linear':
-                alpha_t = args.alpha_T * ((epoch + 1) / args.end_epoch)
-                alpha_t = max(0, alpha_t)
-                alpha_t = 1 - alpha_t
-            elif args.coeff_decay == 'cos':
-                ratio = 1.0 * epoch / args.end_epoch
-                scale = (math.cos(ratio * PI) + 1.) / 2
-                momentum_label_final = args.cos_min
-                momentum_label_range = args.cos_max - args.cos_min
-                alpha_t = scale * momentum_label_range + momentum_label_final
-
+            if args.dynamic_alpha:
+                # 动态 α_t = 1 - 上一轮历史教师准确率/100
+                # epoch 0 时无历史，使用 cos_max 作为初始值
+                if epoch == 0 or last_hist_acc < 0:
+                    alpha_t = args.cos_max
+                else:
+                    alpha_t = max(0.0, min(1.0, 1.0 - last_hist_acc / 100.0))
+            else:
+                # 支持 alpha_t 衰减周期与训练轮数解耦
+                _alpha_epochs = args.alpha_end_epoch if args.alpha_end_epoch > 0 else args.end_epoch
+                if args.coeff_decay == 'linear':
+                    alpha_t = args.alpha_T * ((epoch + 1) / _alpha_epochs)
+                    alpha_t = max(0, alpha_t)
+                    alpha_t = 1 - alpha_t
+                elif args.coeff_decay == 'cos':
+                    ratio = 1.0 * epoch / _alpha_epochs
+                    scale = (math.cos(ratio * PI) + 1.) / 2
+                    momentum_label_final = args.cos_min
+                    momentum_label_range = args.cos_max - args.cos_min
+                    alpha_t = scale * momentum_label_range + momentum_label_final
         else:
             alpha_t = -1
 
@@ -380,6 +394,11 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                                 alpha_t,
                                 train_loader,
                                 args)
+
+        # 动态 α_t：更新上一轮历史教师准确率（跳过 epoch 0 的 one-hot 伪值）
+        if args.HSKD and args.dynamic_alpha:
+            if train_metrics['hist_acc'] < 99.0:  # 排除 epoch 0 的 one-hot 100%
+                last_hist_acc = train_metrics['hist_acc']
 
         # dist.barrier()
         acc, val_metrics = val(
@@ -421,6 +440,7 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         csv_writer.writerow([epoch,
                              train_metrics['lr'], train_metrics['alpha_t'],
                              train_metrics['loss'], train_metrics['top1'], train_metrics['top5'],
+                             train_metrics['hist_acc'], train_metrics['hist_entropy'],
                              val_metrics['val_top1'], val_metrics['val_top5'],
                              val_metrics['val_b1_top1'], val_metrics['val_b2_top1'], val_metrics['val_b3_top1']])
         csv_file.flush()
@@ -465,7 +485,9 @@ def train(all_predictions,
     train_top1 = AverageMeter()
     train_top5 = AverageMeter()
     train_losses = AverageMeter()
-    
+    hist_acc_meter = AverageMeter()
+    hist_entropy_meter = AverageMeter()
+
     # correct = 0
     # total = 0
 
@@ -509,6 +531,15 @@ def train(all_predictions,
 
             soft_b3_targets = (alpha_t * targets_one_hot) + ((1 - alpha_t) * b3_predictions[input_indices])
             soft_b3_targets = torch.autograd.Variable(soft_b3_targets).cuda()
+
+            # --- 历史教师质量监测 ---
+            # 此时 all_predictions[input_indices] 仍是上一轮 epoch 的预测（历史教师）
+            with torch.no_grad():
+                _hist_pred = all_predictions[input_indices]
+                _hist_hit = (_hist_pred.argmax(dim=1) == targets.cpu()).float().sum().item()
+                _hist_ent = -(_hist_pred * torch.log(_hist_pred + 1e-8)).sum(dim=1).mean().item()
+                hist_acc_meter.update(_hist_hit / inputs.size(0) * 100.0, inputs.size(0))
+                hist_entropy_meter.update(_hist_ent, inputs.size(0))
 
             inputs = torch.autograd.Variable(inputs, requires_grad=True)    
             
@@ -625,7 +656,7 @@ def train(all_predictions,
     # dist.barrier()
     
     logger = logging.getLogger('train')
-    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}]'.format(
+    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}] [hist_acc {:.2f}] [hist_ent {:.3f}]'.format(
         args.rank,
         epoch,
         args.HSKD,
@@ -633,7 +664,9 @@ def train(all_predictions,
         alpha_t,
         train_losses.avg,
         train_top1.avg,
-        train_top5.avg))
+        train_top5.avg,
+        hist_acc_meter.avg if args.HSKD else -1,
+        hist_entropy_meter.avg if args.HSKD else -1))
     
     # [DTSKD-PLOT] 收集训练指标用于CSV记录
     train_metrics = {
@@ -641,7 +674,9 @@ def train(all_predictions,
         'top1': train_top1.avg,
         'top5': train_top5.avg,
         'lr': current_LR,
-        'alpha_t': alpha_t
+        'alpha_t': alpha_t,
+        'hist_acc': hist_acc_meter.avg if args.HSKD else -1,
+        'hist_entropy': hist_entropy_meter.avg if args.HSKD else -1,
     }
     return all_predictions, b1_predictions, b2_predictions, b3_predictions, train_metrics
 
