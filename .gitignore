@@ -1,1 +1,19 @@
-/.DS_Store
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Data & Experiments (large files)
+data/
+experiments/
+tempsave100/
+
+# PDFs
+*.pdf
+
+# Misc
+.DS_Store
+pythonProject/

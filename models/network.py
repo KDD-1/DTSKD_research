@@ -17,7 +17,7 @@ def get_network(args):
     if args.data_type == 'cifar100':
         if args.classifier_type == 'resnet18_dtskd':
             net = resnet18_dtskd(num_classes=100)
-        elif args.classfier_type == 'resnext18_dtskd':
+        elif args.classifier_type == 'resnext18_dtskd':
             net = resnext18_dtskd(num_classes=100)
         elif args.classifier_type == 'shufflev2_dtskd':
             net = shufflenetv2(num_classes=100)

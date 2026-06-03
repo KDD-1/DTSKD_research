@@ -27,6 +27,7 @@ from utils.label_dynamic import *
 import os, logging
 import argparse
 import numpy as np
+import csv  # [DTSKD-PLOT] 用于记录训练指标到CSV
 
 
 #----------------------------------------------------
@@ -76,7 +77,7 @@ def parse_args():
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
-    parser.add_argument('--resume', type=str, default=None, help='load model path')
+    parser.add_argument('--resume', type=str, default='', help='load model path')
     parser.add_argument('--random_seed', type=int, default=27)
     parser.add_argument('--tsne', type=int, default=0)
     args = parser.parse_args()
@@ -256,16 +257,38 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         criterion_CE_hskd = None
         criterion_KD_hskd = None
     optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=True)
+    # resume
+    if args.resume != '':
+
+        checkpoint = torch.load(args.resume, map_location='cuda')
+
+        net.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        args.start_epoch = checkpoint['epoch'] + 1
+
+        if 'best_acc' in checkpoint:
+            best_acc = checkpoint['best_acc']
+
+        print(f"Resume from epoch {args.start_epoch}")
 
     #----------------------------------------------------
     #  Empty matrix for store predictions
     #----------------------------------------------------
     if args.HSKD:
-        all_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
-        b1_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
-        b2_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
-        b3_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
-        print(C.underline(C.yellow("[Info] all_predictions matrix shape {} ".format(all_predictions.shape))))
+        # [FIX] 如果resume且checkpoint包含预测矩阵，则恢复；否则初始化为零
+        if args.resume != '' and 'all_predictions' in checkpoint:
+            all_predictions = checkpoint['all_predictions'].cpu()
+            b1_predictions = checkpoint['b1_predictions'].cpu()
+            b2_predictions = checkpoint['b2_predictions'].cpu()
+            b3_predictions = checkpoint['b3_predictions'].cpu()
+            print(C.underline(C.yellow("[Info] all_predictions matrix restored from checkpoint, shape {} ".format(all_predictions.shape))))
+        else:
+            all_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
+            b1_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
+            b2_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
+            b3_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
+            print(C.underline(C.yellow("[Info] all_predictions matrix shape {} ".format(all_predictions.shape))))
     else:
         all_predictions = None
         b1_predictions = None
@@ -281,15 +304,22 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
             checkpoint = torch.load(args.resume)
         else:
             # Map model to be loaded to specified single gpu.
-            dist.barrier()
+            if args.distributed:
+                dist.barrier()
             loc = 'cuda:{}'.format(args.gpu)
             checkpoint = torch.load(args.resume, map_location=loc)
-        
-        args.start_epoch = checkpoint['epoch'] + 1 
-        alpha_t = checkpoint['alpha_t']
+
+        args.start_epoch = checkpoint['epoch'] + 1
+        alpha_t = checkpoint['alpha_t'] if 'alpha_t' in checkpoint else 0.9
         best_acc = checkpoint['best_acc']
-        net.load_state_dict(checkpoint['net'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        net.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # [FIX] 恢复HSKD历史预测矩阵
+        if args.HSKD and 'all_predictions' in checkpoint:
+            all_predictions = checkpoint['all_predictions'].cpu()
+            b1_predictions = checkpoint['b1_predictions'].cpu()
+            b2_predictions = checkpoint['b2_predictions'].cpu()
+            b3_predictions = checkpoint['b3_predictions'].cpu()
         print(C.green("[!] [Rank {}] Model loaded".format(args.rank)))
 
         del checkpoint
@@ -300,7 +330,15 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
 
     best_acc=0
     logger = logging.getLogger('best')
-    
+
+    # [DTSKD-PLOT] 创建CSV文件记录每个epoch的指标，用于后续绘图
+    csv_path = os.path.join(log_dir, 'metrics.csv')
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['epoch', 'lr', 'alpha_t',
+                         'train_loss', 'train_top1', 'train_top5',
+                         'val_top1', 'val_top5',
+                         'val_b1_top1', 'val_b2_top1', 'val_b3_top1'])
 
     for epoch in range(args.start_epoch, args.end_epoch):
         
@@ -327,7 +365,7 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         else:
             alpha_t = -1
 
-        all_predictions, b1_predictions, b2_predictions, b3_predictions = train(
+        all_predictions, b1_predictions, b2_predictions, b3_predictions, train_metrics = train(
                                 all_predictions,
                                 b1_predictions,
                                 b2_predictions,
@@ -344,21 +382,61 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                                 args)
 
         # dist.barrier()
-        acc = val(
+        acc, val_metrics = val(
                   net,
                   epoch,
                   valid_loader,
                   out_list,
                   target_list,
                   args)
+        # ===== 保存 checkpoint =====
+        checkpoint_dir = os.path.join(
+            args.experiments_dir,
+            args.experiments_name,
+            'checkpoint'
+        )
 
-        if epoch > 200:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        save_dict = {
+            'epoch': epoch,
+            'model_state_dict': net.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'acc': acc,
+            'best_acc': best_acc,
+            'alpha_t': alpha_t if args.HSKD else -1
+        }
+        # [FIX] 保存HSKD历史预测矩阵，支持完美续训
+        if args.HSKD:
+            save_dict['all_predictions'] = all_predictions
+            save_dict['b1_predictions'] = b1_predictions
+            save_dict['b2_predictions'] = b2_predictions
+            save_dict['b3_predictions'] = b3_predictions
+        torch.save(save_dict, os.path.join(
+            checkpoint_dir,
+            'latest_checkpoint.pth'
+        ))
+
+        # [DTSKD-PLOT] 将当前epoch指标写入CSV
+        csv_writer.writerow([epoch,
+                             train_metrics['lr'], train_metrics['alpha_t'],
+                             train_metrics['loss'], train_metrics['top1'], train_metrics['top5'],
+                             val_metrics['val_top1'], val_metrics['val_top5'],
+                             val_metrics['val_b1_top1'], val_metrics['val_b2_top1'], val_metrics['val_b3_top1']])
+        csv_file.flush()
+
+        print(f"[Checkpoint Saved] Epoch {epoch}")
+
+        if epoch > 50:
             if acc > best_acc:
                 best_acc = acc
                 # print('')
                 logger.info('-------best acc-------')
                 if args.tsne:
                     savepickle([torch.cat(out_list), torch.cat(target_list)], os.path.join(args.experiments_dir, args.experiments_name, 'baseline_res18_logits.pkl'))
+
+    # [DTSKD-PLOT] 关闭CSV文件
+    csv_file.close()
 
     # cleanup()
     print(C.green("[!] [Rank {}] Distroy Distributed process".format(args.rank)))
@@ -401,18 +479,25 @@ def train(all_predictions,
             inputs = inputs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
 
+        # =====================================================================
+        # [DTSKD-核心] 历史知识蒸馏 (HSKD: Historical Self-KD) 分支
+        # =====================================================================
         if args.HSKD:
+            # --- 1. 构造 one-hot 标签 ---
             targets_numpy = targets.cpu().detach().numpy()
-            identity_matrix = torch.eye(len(train_loader.dataset.classes)) 
-            targets_one_hot = identity_matrix[targets_numpy]
-            
+            identity_matrix = torch.eye(len(train_loader.dataset.classes))
+            targets_one_hot = identity_matrix[targets_numpy]  # [batch, 100]
+
+            # Epoch 0: 用 one-hot 初始化历史预测矩阵 (尚无历史)
             if epoch == 0:
                 all_predictions[input_indices] = targets_one_hot
                 b1_predictions[input_indices] = targets_one_hot
                 b2_predictions[input_indices] = targets_one_hot
                 b3_predictions[input_indices] = targets_one_hot
-                
-            # create new soft-targets
+
+            # --- 2. 生成历史软目标 (EMA 混合) ---
+            # soft_target = α_t × one_hot + (1-α_t) × last_epoch_prediction
+            # α_t 随 epoch 从 0.9→0.0 衰减，即越训练越依赖上一轮的预测
             soft_targets = (alpha_t * targets_one_hot) + ((1 - alpha_t) * all_predictions[input_indices])
             soft_targets = torch.autograd.Variable(soft_targets).cuda()
 
@@ -427,23 +512,36 @@ def train(all_predictions,
 
             inputs = torch.autograd.Variable(inputs, requires_grad=True)    
             
-            # student model
-            # compute output
+            # --- 3. 混合精度前向传播 (AMP) ---
             with autocast():
+                # 模型输出: backbone, branch1, branch2, branch3 四组预测
                 outputs, b1_output, b2_output, b3_output = net(inputs)
+
+                # softmax 用于历史预测更新 & 分布式 all_gather
                 softmax_output = F.softmax(outputs, dim=1)
                 b1_softmax_out = F.softmax(b1_output, dim=1)
                 b2_softmax_out = F.softmax(b2_output, dim=1)
                 b3_softmax_out = F.softmax(b3_output, dim=1)
 
+                # ============================================================
+                # CE Loss (交叉熵 / 与历史软目标的 KL 散度)
+                # 每个输出头分别与自己的历史软目标计算 CE loss
+                # backbone_weight=3.0 表示主干损失权重是分支的 3 倍
+                # ============================================================
                 loss_ce = args.backbone_weight * criterion_CE_hskd(outputs, soft_targets)
                 loss_ce += args.b1_weight * criterion_CE_hskd(b1_output, soft_b1_targets)
                 loss_ce += args.b2_weight * criterion_CE_hskd(b2_output, soft_b2_targets)
                 loss_ce += args.b3_weight * criterion_CE_hskd(b3_output, soft_b3_targets)
-                        
-                loss_kd = criterion_KD_hskd(b1_output, outputs)
-                loss_kd += criterion_KD_hskd(b2_output, outputs)
-                loss_kd += criterion_KD_hskd(b3_output, outputs)
+
+                # ============================================================
+                # KD Loss (结构知识蒸馏)
+                # b1/b2/b3 三个分支对齐 backbone 主干的输出
+                # backbone 是"结构教师" (Structural Teacher)
+                # 分支是"学生" — 学习 backbone 的软标签分布
+                # ============================================================
+                loss_kd = criterion_KD_hskd(b1_output, outputs)   # 浅层分支 → backbone
+                loss_kd += criterion_KD_hskd(b2_output, outputs)  # 中层分支 → backbone
+                loss_kd += criterion_KD_hskd(b3_output, outputs)  # 深层分支 → backbone
 
                 if args.distributed:
                     gathered_prediction = [torch.ones_like(softmax_output) for _ in range(dist.get_world_size())]
@@ -466,14 +564,24 @@ def train(all_predictions,
                     dist.all_gather(gathered_indices, input_indices.cuda())
                     gathered_indices = torch.cat(gathered_indices, dim=0)
 
+        # =====================================================================
+        # [DTSKD] 无历史蒸馏 (HSKD=0): 纯结构蒸馏 + 标准CE
+        # =====================================================================
         else:
             outputs, b1_output, b2_output, b3_output = net(inputs)
 
+            # 标准交叉熵 (用 one-hot 标签)
             loss_ce = criterion_CE(outputs, targets)
+
+            # 结构蒸馏: b1/b2/b3 学习 backbone 的软标签输出
             loss_kd = criterion_KD(b1_output, outputs)
             loss_kd += criterion_KD(b2_output, outputs)
             loss_kd += criterion_KD(b3_output, outputs)
-        
+
+        # =====================================================================
+        # 总损失: loss = ce_weight × CE + kd_weight × KD
+        # 默认 ce_weight=0.2, kd_weight=0.8 (蒸馏信号占主导)
+        # =====================================================================
         loss = args.ce_weight * loss_ce + args.kd_weight * loss_kd
 
         train_losses.update(loss.item(), inputs.size(0))
@@ -490,14 +598,26 @@ def train(all_predictions,
         scaler.step(optimizer)
         scaler.update()
 
+        # =====================================================================
+        # [DTSKD-核心] 更新历史预测矩阵 (用于下一轮的软目标生成)
+        # =====================================================================
         if args.HSKD:
             if args.multiprocessing_distributed:
-                # if epoch == 0:
+                # 分布式训练: 用 all_gather 收集所有 GPU 上的预测再更新
                 for jdx in range(len(gathered_prediction)):
                     all_predictions[gathered_indices[jdx]] = gathered_prediction[jdx]
                     b1_predictions[gathered_indices[jdx]] = b1_gathered_pre[jdx]
                     b2_predictions[gathered_indices[jdx]] = b2_gathered_pre[jdx]
                     b3_predictions[gathered_indices[jdx]] = b3_gathered_pre[jdx]
+            else:
+                # [BugFix] 单GPU训练: 用当前 epoch 的 softmax 输出更新历史矩阵
+                # 原代码缺少此分支，导致 all_predictions 始终为 epoch0 的 one-hot
+                # HSKD 退化为普通 CE training — 这是作者 README 提到的已知问题
+                with torch.no_grad():
+                    all_predictions[input_indices] = softmax_output.cpu()
+                    b1_predictions[input_indices] = b1_softmax_out.cpu()
+                    b2_predictions[input_indices] = b2_softmax_out.cpu()
+                    b3_predictions[input_indices] = b3_softmax_out.cpu()
 
         progress_bar(epoch,batch_idx, len(train_loader),args, 'lr: {:.1e} | alpha_t: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f}'.format(
             current_LR, alpha_t, train_top1.avg, train_top5.avg))
@@ -515,7 +635,15 @@ def train(all_predictions,
         train_top1.avg,
         train_top5.avg))
     
-    return all_predictions, b1_predictions, b2_predictions, b3_predictions
+    # [DTSKD-PLOT] 收集训练指标用于CSV记录
+    train_metrics = {
+        'loss': train_losses.avg,
+        'top1': train_top1.avg,
+        'top5': train_top5.avg,
+        'lr': current_LR,
+        'alpha_t': alpha_t
+    }
+    return all_predictions, b1_predictions, b2_predictions, b3_predictions, train_metrics
 
 
 def val(
@@ -580,7 +708,15 @@ def val(
                     val_b3_top1.avg,
                     ))
 
-    return val_top1.avg
+    # [DTSKD-PLOT] 收集验证指标用于CSV记录
+    val_metrics = {
+        'val_top1': val_top1.avg,
+        'val_top5': val_top5.avg,
+        'val_b1_top1': val_b1_top1.avg,
+        'val_b2_top1': val_b2_top1.avg,
+        'val_b3_top1': val_b3_top1.avg,
+    }
+    return val_top1.avg, val_metrics
 
 
 def cleanup():
