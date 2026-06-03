@@ -66,6 +66,7 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default=None, help='download dataset path')
     parser.add_argument('--data_type', type=str, default=None, help='type of dataset')
     parser.add_argument('--alpha_T',default=0.8 ,type=float, help='alpha_T')
+    parser.add_argument('--alpha_end_epoch', default=-1, type=int, help='epoch count for alpha_t schedule (default: same as end_epoch)')
     parser.add_argument('--saveckp_freq', default=299, type=int, help='Save checkpoint every x epochs. Last model saving set to 299')
     parser.add_argument('--rank', default=-1, type=int,help='node rank for distributed training')
     parser.add_argument('--world_size', default=1, type=int,help='number of distributed processes')
@@ -351,12 +352,13 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
             train_sampler.set_epoch(epoch)
 
         if args.HSKD:
+            _alpha_epochs = args.alpha_end_epoch if args.alpha_end_epoch > 0 else args.end_epoch
             if args.coeff_decay == 'linear':
-                alpha_t = args.alpha_T * ((epoch + 1) / args.end_epoch)
+                alpha_t = args.alpha_T * ((epoch + 1) / _alpha_epochs)
                 alpha_t = max(0, alpha_t)
                 alpha_t = 1 - alpha_t
             elif args.coeff_decay == 'cos':
-                ratio = 1.0 * epoch / args.end_epoch
+                ratio = 1.0 * epoch / _alpha_epochs
                 scale = (math.cos(ratio * PI) + 1.) / 2
                 momentum_label_final = args.cos_min
                 momentum_label_range = args.cos_max - args.cos_min
