@@ -13,6 +13,14 @@ import os, sys, shutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ============================================================
+# 0. 安装依赖
+# ============================================================
+import subprocess
+print("=== Installing dependencies ===")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "yacs"])
+print("=== Done ===\n")
+
+# ============================================================
 # 1. 初始化 c2net + 重定向日志
 # ============================================================
 from c2net.context import prepare, upload_output
