@@ -16,15 +16,53 @@ from torchvision import transforms
 # etc
 #--------------
 import os
+import numpy as np
 
 #--------------
-# utils 
+# utils
 #--------------
 from loader import custom_datasets
 from utils import custom_transform
 from utils.color import Colorer
 
 C = Colorer.instance()
+
+
+def apply_symmetric_label_noise(targets, num_classes, noise_rate, seed=42):
+    """
+    对称标签噪声: 以 noise_rate 概率将每个样本的标签随机翻转为其他类别。
+
+    Args:
+        targets: list/array of original labels
+        num_classes: total number of classes
+        noise_rate: fraction of labels to corrupt (0.0 ~ 1.0)
+        seed: random seed for reproducibility
+
+    Returns:
+        noisy_targets: corrupted label array (numpy)
+        flip_mask: boolean array, True for flipped samples
+    """
+    if noise_rate <= 0:
+        return np.array(targets), np.zeros(len(targets), dtype=bool)
+
+    rng = np.random.RandomState(seed)
+    targets = np.array(targets)
+    n = len(targets)
+
+    # 随机选择 noise_rate 比例的样本
+    flip_mask = rng.rand(n) < noise_rate
+    n_flip = flip_mask.sum()
+
+    # 对选中样本随机翻转到其他类别
+    noisy_targets = targets.copy()
+    if n_flip > 0:
+        flip_indices = np.where(flip_mask)[0]
+        for idx in flip_indices:
+            # 随机选一个不等于原标签的类别
+            other_classes = [c for c in range(num_classes) if c != targets[idx]]
+            noisy_targets[idx] = rng.choice(other_classes)
+
+    return noisy_targets, flip_mask
 
 def dataloader(args):
     if args.data_type == 'cifar10':
@@ -47,7 +85,18 @@ def dataloader(args):
         
         trainset = custom_datasets.Custom_CIFAR10(root=args.data_path, train=True, download=True, transform=transform_train)
         validset = custom_datasets.Custom_CIFAR10(root=args.data_path, train=False, download=True, transform=transform_val)
-        
+
+        # [Label Noise] 对称标签噪声 — 仅污染训练集
+        if hasattr(args, 'noise_rate') and args.noise_rate > 0:
+            noisy_targets, flip_mask = apply_symmetric_label_noise(
+                trainset.targets, num_classes=10, noise_rate=args.noise_rate,
+                seed=args.random_seed)
+            n_flipped = flip_mask.sum()
+            trainset.targets = noisy_targets.tolist()
+            print(C.yellow("[!] [Rank {}] Applied {:.0f}% symmetric label noise: "
+                           "{}/{} training labels flipped".format(
+                args.rank, args.noise_rate * 100, n_flipped, len(trainset.targets))))
+
         if args.multiprocessing_distributed:
             train_sampler = torch.utils.data.distributed.DistributedSampler(trainset)
             print(C.green("[!] [Rank {}] Distributed Sampler Data Loading Done".format(args.rank)))
@@ -88,7 +137,18 @@ def dataloader(args):
         
         trainset = custom_datasets.Custom_CIFAR100(root=args.data_path, train=True, download=True, transform=transform_train)
         validset = custom_datasets.Custom_CIFAR100(root=args.data_path, train=False, download=True, transform=transform_val)
-        
+
+        # [Label Noise] 对称标签噪声 — 仅污染训练集
+        if hasattr(args, 'noise_rate') and args.noise_rate > 0:
+            noisy_targets, flip_mask = apply_symmetric_label_noise(
+                trainset.targets, num_classes=100, noise_rate=args.noise_rate,
+                seed=args.random_seed)
+            n_flipped = flip_mask.sum()
+            trainset.targets = noisy_targets.tolist()
+            print(C.yellow("[!] [Rank {}] Applied {:.0f}% symmetric label noise: "
+                           "{}/{} training labels flipped".format(
+                args.rank, args.noise_rate * 100, n_flipped, len(trainset.targets))))
+
         if args.multiprocessing_distributed:
             train_sampler = torch.utils.data.distributed.DistributedSampler(trainset)
             print(C.green("[!] [Rank {}] Distributed Sampler Data Loading Done".format(args.rank)))

@@ -81,6 +81,21 @@ def parse_args():
     parser.add_argument('--resume', type=str, default='', help='load model path')
     parser.add_argument('--random_seed', type=int, default=27)
     parser.add_argument('--tsne', type=int, default=0)
+    parser.add_argument('--track_forgetting', type=int, default=0,
+                        help='Track per-sample correctness on val set for forgetting analysis')
+    parser.add_argument('--ewc_lambda', type=float, default=0.0,
+                        help='EWC regularization strength (0=disabled)')
+    parser.add_argument('--ewc_freq', type=int, default=5,
+                        help='Update Fisher information every N epochs')
+    # [Anti-Forgetting SKD] 置信度加权的输出空间 KL 约束
+    parser.add_argument('--af_lambda', type=float, default=0.0,
+                        help='Anti-Forgetting SKD: KL regularization strength (0=disabled)')
+    parser.add_argument('--af_alpha', type=float, default=2.0,
+                        help='Anti-Forgetting SKD: exponential scale factor for margin→weight mapping')
+    parser.add_argument('--af_tau', type=float, default=0.2,
+                        help='Anti-Forgetting SKD: neutral threshold (m_i=tau → w_i=1)')
+    parser.add_argument('--noise_rate', type=float, default=0.0,
+                        help='Symmetric label noise rate on training set (0.0 = clean, 0.2 = 20%%, 0.4 = 40%%)')
     args = parser.parse_args()
     return check_args(args)
 
@@ -295,7 +310,18 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         b1_predictions = None
         b2_predictions = None
         b3_predictions = None
-    
+
+    # [MCW-AF v3] Per-sample prediction stability (EMA of correctness)
+    # stability[i] ≈ 样本 i 最近被正确分类的频率
+    # 用于自适应 AF 强度: 稳定样本强保护, 振荡样本弱/不保护
+    if args.HSKD and args.af_lambda > 0.0:
+        if args.resume != '' and 'stability' in checkpoint:
+            stability = checkpoint['stability'].cpu()
+        else:
+            stability = torch.zeros(len(train_loader.dataset), dtype=torch.float32)
+    else:
+        stability = None
+
     #----------------------------------------------------
     #  load status & Resume Learning
     #----------------------------------------------------
@@ -334,15 +360,28 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
 
     # [DTSKD-PLOT] 创建CSV文件记录每个epoch的指标，用于后续绘图
     csv_path = os.path.join(log_dir, 'metrics.csv')
-    csv_file = open(csv_path, 'w', newline='')
+    csv_mode = 'a' if args.resume else 'w'
+    csv_file = open(csv_path, csv_mode, newline='')
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['epoch', 'lr', 'alpha_t',
-                         'train_loss', 'train_top1', 'train_top5',
-                         'val_top1', 'val_top5',
-                         'val_b1_top1', 'val_b2_top1', 'val_b3_top1'])
+    if not args.resume:
+        csv_writer.writerow(['epoch', 'lr', 'alpha_t',
+                             'train_loss', 'train_top1', 'train_top5',
+                             'val_top1', 'val_top5',
+                             'val_b1_top1', 'val_b2_top1', 'val_b3_top1',
+                             'af_loss'])
+
+    # [FORGETTING] 初始化 per-sample correctness 存储
+    if args.track_forgetting:
+        num_val_samples = len(valid_loader.dataset)
+        per_sample_correct = torch.zeros(num_val_samples, dtype=torch.bool)
+        forgetting_dir = os.path.join(log_dir, 'forgetting')
+        os.makedirs(forgetting_dir, exist_ok=True)
+
+    # [EWC] 初始化: 第一个 epoch 后, 用当前参数作为参考点 θ*
+    global _ewc_ref_params, _ewc_fisher
 
     for epoch in range(args.start_epoch, args.end_epoch):
-        
+
         # if args.tsne:
         out_list = []
         target_list = []
@@ -367,11 +406,12 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         else:
             alpha_t = -1
 
-        all_predictions, b1_predictions, b2_predictions, b3_predictions, train_metrics = train(
+        all_predictions, b1_predictions, b2_predictions, b3_predictions, stability, train_metrics = train(
                                 all_predictions,
                                 b1_predictions,
                                 b2_predictions,
                                 b3_predictions,
+                                stability,
                                 criterion_CE,
                                 criterion_CE_hskd,
                                 criterion_KD,
@@ -384,13 +424,41 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                                 args)
 
         # dist.barrier()
-        acc, val_metrics = val(
-                  net,
-                  epoch,
-                  valid_loader,
-                  out_list,
-                  target_list,
-                  args)
+        if args.track_forgetting:
+            acc, val_metrics, per_sample_correct = val(
+                      net,
+                      epoch,
+                      valid_loader,
+                      out_list,
+                      target_list,
+                      args,
+                      per_sample_correct=per_sample_correct,
+                      num_val_samples=num_val_samples)
+            # 每个 epoch 保存 per-sample correctness
+            torch.save(per_sample_correct.clone(),
+                       os.path.join(forgetting_dir, f'correct_epoch_{epoch:04d}.pt'))
+        else:
+            acc, val_metrics = val(
+                      net,
+                      epoch,
+                      valid_loader,
+                      out_list,
+                      target_list,
+                      args)
+        # ===== [EWC] 更新 Fisher 信息和参考参数 =====
+        if args.ewc_lambda > 0 and args.track_forgetting:
+            update_interval = max(1, args.ewc_freq)
+            if epoch % update_interval == 0 and epoch >= args.ewc_freq:
+                # 用当前正确分类的验证集样本计算 Fisher
+                correct_indices = per_sample_correct.nonzero(as_tuple=True)[0]
+                if len(correct_indices) > 0:
+                    _ewc_fisher = compute_ewc_fisher(
+                        net, valid_loader, criterion_CE, args,
+                        num_samples=min(2000, len(correct_indices)))
+                    _ewc_ref_params = update_ewc_ref(net)
+                    print(f'[EWC] Updated Fisher & Ref Params at epoch {epoch} '
+                          f'(on {len(correct_indices)} correct samples)')
+
         # ===== 保存 checkpoint =====
         checkpoint_dir = os.path.join(
             args.experiments_dir,
@@ -414,6 +482,9 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
             save_dict['b1_predictions'] = b1_predictions
             save_dict['b2_predictions'] = b2_predictions
             save_dict['b3_predictions'] = b3_predictions
+        # [v3] 保存 stability 矩阵
+        if stability is not None:
+            save_dict['stability'] = stability
         torch.save(save_dict, os.path.join(
             checkpoint_dir,
             'latest_checkpoint.pth'
@@ -424,7 +495,8 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                              train_metrics['lr'], train_metrics['alpha_t'],
                              train_metrics['loss'], train_metrics['top1'], train_metrics['top5'],
                              val_metrics['val_top1'], val_metrics['val_top5'],
-                             val_metrics['val_b1_top1'], val_metrics['val_b2_top1'], val_metrics['val_b3_top1']])
+                             val_metrics['val_b1_top1'], val_metrics['val_b2_top1'], val_metrics['val_b3_top1'],
+                             train_metrics['af_loss']])
         csv_file.flush()
 
         print(f"[Checkpoint Saved] Epoch {epoch}")
@@ -445,14 +517,97 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
 
 
 from torch.cuda.amp import GradScaler as GradScaler
+
+# ============================================================
+# EWC (Elastic Weight Consolidation) for SKD
+# ============================================================
+def compute_ewc_fisher(net, dataloader, criterion_ce, args, num_samples=2000):
+    """
+    计算 Fisher 信息矩阵对角线，仅对当前正确分类的样本。
+
+    数学: F_i = E_x[(∂L_CE/∂θ_i)^2]
+    仅对 ŷ(x) == y 的样本计算，保护"已知正确知识"不被遗忘。
+
+    返回: {name: fisher_diagonal_tensor}
+    """
+    net.eval()
+    fisher = {}
+    for name, param in net.named_parameters():
+        fisher[name] = torch.zeros_like(param)
+
+    count = 0
+    for inputs, targets, _ in dataloader:
+        if count >= num_samples:
+            break
+        if args.gpu is not None:
+            inputs = inputs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+
+        net.zero_grad()
+        outputs, _, _, _ = net(inputs)
+        loss = criterion_ce(outputs, targets)
+        loss.backward()
+
+        # 只累积正确分类样本的 Fisher
+        _, predicted = outputs.max(1)
+        correct_mask = (predicted == targets).float()
+
+        for name, param in net.named_parameters():
+            if param.grad is not None:
+                # F_i += (∂L/∂θ_i)^2，对正确样本加权
+                grad_sq = param.grad.data ** 2
+                # 按样本平均（简化：用 batch 内正确样本比例缩放）
+                weight = correct_mask.mean()
+                fisher[name] += grad_sq * weight
+
+        count += inputs.size(0)
+
+    # 归一化
+    for name in fisher:
+        fisher[name] /= max(count / inputs.size(0), 1)  # 按 batch 数平均
+
+    net.train()
+    return fisher
+
+
+def ewc_loss(net, fisher, ref_params, args):
+    """
+    计算 EWC 正则化损失。
+
+    L_EWC = (λ/2) * Σ_i F_i * (θ_i - θ_i*)^2
+
+    使用教师置信度加权: λ_eff = λ * max_c p_t(c|x)
+    """
+    if args.ewc_lambda <= 0 or not fisher:
+        return torch.tensor(0.0).cuda()
+
+    loss = 0.0
+    for name, param in net.named_parameters():
+        if name in fisher and name in ref_params:
+            loss += (fisher[name] * (param - ref_params[name]) ** 2).sum()
+
+    return 0.5 * args.ewc_lambda * loss
+
+
+def update_ewc_ref(net):
+    """保存当前参数作为 EWC 参考点 θ*"""
+    ref = {}
+    for name, param in net.named_parameters():
+        ref[name] = param.data.clone()
+    return ref
 from torch.cuda.amp import autocast as autocast
 
 scaler = GradScaler()
+
+# EWC 全局状态 (避免修改 train() 函数签名)
+_ewc_ref_params = {}
+_ewc_fisher = {}
 
 def train(all_predictions,
         b1_predictions,
         b2_predictions,
         b3_predictions,
+        stability,
           criterion_CE,
           criterion_CE_hskd,
           criterion_KD,
@@ -467,6 +622,7 @@ def train(all_predictions,
     train_top1 = AverageMeter()
     train_top5 = AverageMeter()
     train_losses = AverageMeter()
+    train_af_losses = AverageMeter()  # Anti-Forgetting 加权 KL 损失
     
     # correct = 0
     # total = 0
@@ -586,6 +742,54 @@ def train(all_predictions,
         # =====================================================================
         loss = args.ce_weight * loss_ce + args.kd_weight * loss_kd
 
+        # =====================================================================
+        # [Anti-Forgetting SKD] 置信度加权的输出空间 KL 约束
+        # 核心: 边际置信度 m_i = p_old(y_i) - max_{c≠y_i} p_old(c)
+        #       m_i ≤ 0 → w_i = 0 (抽奖机制, 完全放弃错误历史知识)
+        #       m_i > 0 → w_i = exp(α·(m_i-τ)) (指数型动态权重, 保护高置信度正确知识)
+        #       KL(p_old || p_new) 强制新分布覆盖旧分布的高概率区域
+        # =====================================================================
+        if args.HSKD and args.af_lambda > 0.0 and epoch > 0:
+            # [v3] 更新 per-sample 预测稳定性 (正确分类的 EMA)
+            with torch.no_grad():
+                correct_mask = (softmax_output.argmax(dim=1) == targets).float().cpu()
+                stability[input_indices] = 0.9 * stability[input_indices] + 0.1 * correct_mask
+                stab_batch = stability[input_indices].cuda()
+
+                p_old_batch = all_predictions[input_indices].cuda()
+                # 式(1): 边际置信度 — 识别"可靠知识"与"噪声"
+                p_old_correct = p_old_batch[torch.arange(p_old_batch.size(0)), targets]
+                p_old_masked = p_old_batch.clone()
+                p_old_masked[torch.arange(p_old_masked.size(0)), targets] = -float('inf')
+                p_old_max_wrong = p_old_masked.max(dim=1).values
+                m = p_old_correct - p_old_max_wrong
+                # 式(2): 动态连续权重 — "抽奖机制" (m_i≤0→0) + 指数型映射 (m_i>0)
+                w = torch.where(
+                    m > 0,
+                    torch.exp(args.af_alpha * (m - args.af_tau)),
+                    torch.zeros_like(m)
+                )
+
+            # 前向 KL: KL(p_old || p_new) — 用旧分布"检查"新分布
+            log_p_new = torch.log(softmax_output + 1e-10)
+            kl_per_sample = F.kl_div(log_p_new, p_old_batch, reduction='none').sum(dim=1)
+
+            # 式(3): 加权 KL 均值
+            # [v3] w_i 乘 stability_i: 只有稳定正确+高边际置信度的样本才获强保护
+            # (1-α_t) 全局调度: 早期弱(自由探索), 后期强(巩固保护)
+            af_weights = args.af_lambda * (1.0 - alpha_t) * stab_batch * w
+            loss_af = (af_weights * kl_per_sample).mean()
+            loss = loss + loss_af
+            train_af_losses.update(loss_af.item(), inputs.size(0))
+
+        # [EWC] 弹性权重巩固正则化: L_EWC = (λ/2) * Σ F_i * (θ_i - θ_i*)^2
+        if args.ewc_lambda > 0 and _ewc_ref_params and _ewc_fisher:
+            loss_ewc = 0.0
+            for name, param in net.named_parameters():
+                if name in _ewc_fisher and name in _ewc_ref_params:
+                    loss_ewc += (_ewc_fisher[name] * (param - _ewc_ref_params[name]) ** 2).sum()
+            loss = loss + 0.5 * args.ewc_lambda * loss_ewc
+
         train_losses.update(loss.item(), inputs.size(0))
 
         err1, err5 = accuracy(outputs.data, targets, topk=(1, 5))
@@ -621,13 +825,15 @@ def train(all_predictions,
                     b2_predictions[input_indices] = b2_softmax_out.cpu()
                     b3_predictions[input_indices] = b3_softmax_out.cpu()
 
-        progress_bar(epoch,batch_idx, len(train_loader),args, 'lr: {:.1e} | alpha_t: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f}'.format(
-            current_LR, alpha_t, train_top1.avg, train_top5.avg))
+        af_info = ' | af_loss: {:.3f} (stab={:.2f})'.format(train_af_losses.avg, stability.mean().item()) if args.af_lambda > 0 else ''
+        progress_bar(epoch,batch_idx, len(train_loader),args, 'lr: {:.1e} | alpha_t: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f}{}'.format(
+            current_LR, alpha_t, train_top1.avg, train_top5.avg, af_info))
 
     # dist.barrier()
     
     logger = logging.getLogger('train')
-    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}]'.format(
+    af_log = ' [af_loss {:.3f}]'.format(train_af_losses.avg) if args.af_lambda > 0 else ''
+    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}]{}'.format(
         args.rank,
         epoch,
         args.HSKD,
@@ -635,7 +841,8 @@ def train(all_predictions,
         alpha_t,
         train_losses.avg,
         train_top1.avg,
-        train_top5.avg))
+        train_top5.avg,
+        af_log))
     
     # [DTSKD-PLOT] 收集训练指标用于CSV记录
     train_metrics = {
@@ -643,9 +850,10 @@ def train(all_predictions,
         'top1': train_top1.avg,
         'top5': train_top5.avg,
         'lr': current_LR,
-        'alpha_t': alpha_t
+        'alpha_t': alpha_t,
+        'af_loss': train_af_losses.avg if args.af_lambda > 0 else 0.0
     }
-    return all_predictions, b1_predictions, b2_predictions, b3_predictions, train_metrics
+    return all_predictions, b1_predictions, b2_predictions, b3_predictions, stability, train_metrics
 
 
 def val(
@@ -654,7 +862,9 @@ def val(
         val_loader,
         out_list,
         target_list,
-        args):
+        args,
+        per_sample_correct=None,
+        num_val_samples=None):
 
     val_top1 = AverageMeter()
     val_top5 = AverageMeter()
@@ -662,16 +872,27 @@ def val(
     val_b2_top1 = AverageMeter()
     val_b3_top1 = AverageMeter()
 
+    # [FORGETTING] 初始化 per-sample correctness 追踪
+    if args.track_forgetting and per_sample_correct is None:
+        per_sample_correct = torch.zeros(num_val_samples, dtype=torch.bool)
+
     net.eval()
     with torch.no_grad():
-        for batch_idx, (inputs, targets, _) in enumerate(val_loader):              
-            
+        for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
+
             if args.gpu is not None:
                 inputs = inputs.cuda(args.gpu, non_blocking=True)
                 targets = targets.cuda(args.gpu, non_blocking=True)
 
             # model output
             outputs, b1_out, b2_out, b3_out = net(inputs)
+
+            # [FORGETTING] 记录每个样本是否被正确分类
+            if args.track_forgetting:
+                _, predicted = outputs.max(1)
+                correct = predicted.eq(targets).cpu()
+                for i, idx in enumerate(indices):
+                    per_sample_correct[idx] = correct[i]
 
             #Top1, Top5 Err
             err1, err5 = accuracy(outputs.data, targets, topk=(1, 5))
@@ -680,13 +901,13 @@ def val(
 
             b1_err1, _ = accuracy(b1_out.data, targets, topk=(1, 5))
             val_b1_top1.update(b1_err1.item(), inputs.size(0))
-            
+
             b2_err1, _ = accuracy(b2_out.data, targets, topk=(1, 5))
             val_b2_top1.update(b2_err1.item(), inputs.size(0))
-            
+
             b3_err1, _ = accuracy(b3_out.data, targets, topk=(1, 5))
             val_b3_top1.update(b3_err1.item(), inputs.size(0))
-            
+
             if args.tsne:
                 out_list.append(outputs.cpu())
                 target_list.append(targets.cpu())
@@ -697,7 +918,7 @@ def val(
                         ))
 
     # dist.barrier()
-            
+
     if is_main_process():
 
         logger = logging.getLogger('val')
@@ -718,6 +939,9 @@ def val(
         'val_b2_top1': val_b2_top1.avg,
         'val_b3_top1': val_b3_top1.avg,
     }
+
+    if args.track_forgetting:
+        return val_top1.avg, val_metrics, per_sample_correct
     return val_top1.avg, val_metrics
 
 
