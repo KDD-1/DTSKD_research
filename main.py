@@ -627,7 +627,12 @@ def train(all_predictions,
     net.train()
     current_LR = get_learning_rate(optimizer)[0]
 
+    t_data = 0.0
+    t_gpu = 0.0
+    t0 = time.time()
     for batch_idx, (inputs, targets, input_indices) in enumerate(train_loader):
+        t1 = time.time()
+        t_data += t1 - t0
         optimizer.zero_grad()
         
         if args.gpu is not None:
@@ -822,24 +827,21 @@ def train(all_predictions,
                     b2_predictions[input_indices] = b2_softmax_out.cpu()
                     b3_predictions[input_indices] = b3_softmax_out.cpu()
 
+        t2 = time.time()
+        t_gpu += t2 - t1  # time from data-ready to end of GPU+update
+        t0 = t2  # start timing next data-load wait
+
         af_info = ' | af_loss: {:.3f} (stab={:.2f})'.format(train_af_losses.avg, stability.mean().item()) if args.af_lambda > 0 else ''
         progress_bar(epoch,batch_idx, len(train_loader),args, 'lr: {:.1e} | alpha_t: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f}{}'.format(
             current_LR, alpha_t, train_top1.avg, train_top5.avg, af_info))
 
     # dist.barrier()
-    
+
     logger = logging.getLogger('train')
-    af_log = ' [af_loss {:.3f}]'.format(train_af_losses.avg) if args.af_lambda > 0 else ''
-    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}]{}'.format(
-        args.rank,
-        epoch,
-        args.HSKD,
-        current_LR,
-        alpha_t,
-        train_losses.avg,
-        train_top1.avg,
-        train_top5.avg,
-        af_log))
+    logger.info('[Rank {}] [Epoch {}] [HSKD {}] [lr {:.1e}] [alpht_t {:.3f}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}]  [Timing: data={:.1f}s gpu={:.1f}s]'.format(
+        args.rank, epoch, args.HSKD, current_LR, alpha_t,
+        train_losses.avg, train_top1.avg, train_top5.avg,
+        t_data, t_gpu))
     
     # [DTSKD-PLOT] 收集训练指标用于CSV记录
     train_metrics = {
