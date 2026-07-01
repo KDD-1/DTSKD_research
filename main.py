@@ -513,7 +513,10 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
     print(C.green("[!] [Rank {}] Distroy Distributed process".format(args.rank)))
 
 
-from torch.cuda.amp import GradScaler as GradScaler
+# [PERF] 禁用 AMP — PyTorch 2.10 上 deprecated autocast 可能导致性能问题
+# from torch.cuda.amp import GradScaler as GradScaler
+# from torch.cuda.amp import autocast as autocast
+USE_AMP = False  # 设为 True 恢复混合精度
 
 # ============================================================
 # EWC (Elastic Weight Consolidation) for SKD
@@ -592,9 +595,7 @@ def update_ewc_ref(net):
     for name, param in net.named_parameters():
         ref[name] = param.data.clone()
     return ref
-from torch.cuda.amp import autocast as autocast
-
-scaler = GradScaler()
+# [PERF] autocast 和 scaler 已禁用，见文件顶部 USE_AMP
 
 # EWC 全局状态 (避免修改 train() 函数签名)
 _ewc_ref_params = {}
@@ -672,57 +673,51 @@ def train(all_predictions,
 
             inputs = torch.autograd.Variable(inputs, requires_grad=True)    
             
-            # --- 3. 混合精度前向传播 (AMP) ---
-            with autocast():
-                # 模型输出: backbone, branch1, branch2, branch3 四组预测
-                outputs, b1_output, b2_output, b3_output = net(inputs)
+            # --- 3. 前向传播 (FP32, 无 AMP) ---
+            # 模型输出: backbone, branch1, branch2, branch3 四组预测
+            outputs, b1_output, b2_output, b3_output = net(inputs)
 
-                # softmax 用于历史预测更新 & 分布式 all_gather
-                softmax_output = F.softmax(outputs, dim=1)
-                b1_softmax_out = F.softmax(b1_output, dim=1)
-                b2_softmax_out = F.softmax(b2_output, dim=1)
-                b3_softmax_out = F.softmax(b3_output, dim=1)
+            # softmax 用于历史预测更新 & 分布式 all_gather
+            softmax_output = F.softmax(outputs, dim=1)
+            b1_softmax_out = F.softmax(b1_output, dim=1)
+            b2_softmax_out = F.softmax(b2_output, dim=1)
+            b3_softmax_out = F.softmax(b3_output, dim=1)
 
-                # ============================================================
-                # CE Loss (交叉熵 / 与历史软目标的 KL 散度)
-                # 每个输出头分别与自己的历史软目标计算 CE loss
-                # backbone_weight=3.0 表示主干损失权重是分支的 3 倍
-                # ============================================================
-                loss_ce = args.backbone_weight * criterion_CE_hskd(outputs, soft_targets)
-                loss_ce += args.b1_weight * criterion_CE_hskd(b1_output, soft_b1_targets)
-                loss_ce += args.b2_weight * criterion_CE_hskd(b2_output, soft_b2_targets)
-                loss_ce += args.b3_weight * criterion_CE_hskd(b3_output, soft_b3_targets)
+            # ============================================================
+            # CE Loss (交叉熵 / 与历史软目标的 KL 散度)
+            # ============================================================
+            loss_ce = args.backbone_weight * criterion_CE_hskd(outputs, soft_targets)
+            loss_ce += args.b1_weight * criterion_CE_hskd(b1_output, soft_b1_targets)
+            loss_ce += args.b2_weight * criterion_CE_hskd(b2_output, soft_b2_targets)
+            loss_ce += args.b3_weight * criterion_CE_hskd(b3_output, soft_b3_targets)
 
-                # ============================================================
-                # KD Loss (结构知识蒸馏)
-                # b1/b2/b3 三个分支对齐 backbone 主干的输出
-                # backbone 是"结构教师" (Structural Teacher)
-                # 分支是"学生" — 学习 backbone 的软标签分布
-                # ============================================================
-                loss_kd = criterion_KD_hskd(b1_output, outputs)   # 浅层分支 → backbone
-                loss_kd += criterion_KD_hskd(b2_output, outputs)  # 中层分支 → backbone
-                loss_kd += criterion_KD_hskd(b3_output, outputs)  # 深层分支 → backbone
+            # ============================================================
+            # KD Loss (结构知识蒸馏)
+            # ============================================================
+            loss_kd = criterion_KD_hskd(b1_output, outputs)
+            loss_kd += criterion_KD_hskd(b2_output, outputs)
+            loss_kd += criterion_KD_hskd(b3_output, outputs)
 
-                if args.distributed:
-                    gathered_prediction = [torch.ones_like(softmax_output) for _ in range(dist.get_world_size())]
-                    dist.all_gather(gathered_prediction, softmax_output)
-                    gathered_prediction = torch.cat(gathered_prediction, dim=0)
+            if args.distributed:
+                gathered_prediction = [torch.ones_like(softmax_output) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered_prediction, softmax_output)
+                gathered_prediction = torch.cat(gathered_prediction, dim=0)
 
-                    b1_gathered_pre = [torch.ones_like(b1_softmax_out) for _ in range(dist.get_world_size())]
-                    dist.all_gather(b1_gathered_pre, b1_softmax_out)
-                    b1_gathered_pre = torch.cat(b1_gathered_pre, dim=0)
+                b1_gathered_pre = [torch.ones_like(b1_softmax_out) for _ in range(dist.get_world_size())]
+                dist.all_gather(b1_gathered_pre, b1_softmax_out)
+                b1_gathered_pre = torch.cat(b1_gathered_pre, dim=0)
 
-                    b2_gathered_pre = [torch.ones_like(b2_softmax_out) for _ in range(dist.get_world_size())]
-                    dist.all_gather(b2_gathered_pre, b2_softmax_out)
-                    b2_gathered_pre = torch.cat(b2_gathered_pre, dim=0)
+                b2_gathered_pre = [torch.ones_like(b2_softmax_out) for _ in range(dist.get_world_size())]
+                dist.all_gather(b2_gathered_pre, b2_softmax_out)
+                b2_gathered_pre = torch.cat(b2_gathered_pre, dim=0)
 
-                    b3_gathered_pre = [torch.ones_like(b3_softmax_out) for _ in range(dist.get_world_size())]
-                    dist.all_gather(b3_gathered_pre, b3_softmax_out)
-                    b3_gathered_pre = torch.cat(b3_gathered_pre, dim=0)
+                b3_gathered_pre = [torch.ones_like(b3_softmax_out) for _ in range(dist.get_world_size())]
+                dist.all_gather(b3_gathered_pre, b3_softmax_out)
+                b3_gathered_pre = torch.cat(b3_gathered_pre, dim=0)
 
-                    gathered_indices = [torch.ones_like(input_indices.cuda()) for _ in range(dist.get_world_size())]
-                    dist.all_gather(gathered_indices, input_indices.cuda())
-                    gathered_indices = torch.cat(gathered_indices, dim=0)
+                gathered_indices = [torch.ones_like(input_indices.cuda()) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered_indices, input_indices.cuda())
+                gathered_indices = torch.cat(gathered_indices, dim=0)
 
         # =====================================================================
         # [DTSKD] 无历史蒸馏 (HSKD=0): 纯结构蒸馏 + 标准CE
@@ -798,13 +793,9 @@ def train(all_predictions,
         train_top1.update(err1.item(), inputs.size(0))
         train_top5.update(err5.item(), inputs.size(0))
 
-        # compute gradient and do SGD step
-        # loss.backward()
-        # optimizer.step()
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        # compute gradient and do SGD step (FP32, no AMP scaler)
+        loss.backward()
+        optimizer.step()
 
         # =====================================================================
         # [DTSKD-核心] 更新历史预测矩阵 (用于下一轮的软目标生成)
