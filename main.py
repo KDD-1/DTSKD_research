@@ -461,36 +461,26 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                     print(f'[EWC] Updated Fisher & Ref Params at epoch {epoch} '
                           f'(on {len(correct_indices)} correct samples)')
 
-        # ===== 保存 checkpoint =====
-        checkpoint_dir = os.path.join(
-            args.experiments_dir,
-            args.experiments_name,
-            'checkpoint'
-        )
-
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        save_dict = {
-            'epoch': epoch,
-            'model_state_dict': net.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'acc': acc,
-            'best_acc': best_acc,
-            'alpha_t': alpha_t if args.HSKD else -1
-        }
-        # [FIX] 保存HSKD历史预测矩阵，支持完美续训
-        if args.HSKD:
-            save_dict['all_predictions'] = all_predictions
-            save_dict['b1_predictions'] = b1_predictions
-            save_dict['b2_predictions'] = b2_predictions
-            save_dict['b3_predictions'] = b3_predictions
-        # [v3] 保存 stability 矩阵
-        if stability is not None:
-            save_dict['stability'] = stability
-        torch.save(save_dict, os.path.join(
-            checkpoint_dir,
-            'latest_checkpoint.pth'
-        ))
+        # ===== 仅最后一个 epoch 保存 checkpoint 到输出目录 =====
+        if epoch == args.end_epoch - 1:
+            checkpoint_dir = os.path.join(args.experiments_dir, args.experiments_name, 'checkpoint')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'acc': acc,
+                'best_acc': best_acc,
+                'alpha_t': alpha_t if args.HSKD else -1
+            }
+            if args.HSKD:
+                save_dict['all_predictions'] = all_predictions
+                save_dict['b1_predictions'] = b1_predictions
+                save_dict['b2_predictions'] = b2_predictions
+                save_dict['b3_predictions'] = b3_predictions
+            if stability is not None:
+                save_dict['stability'] = stability
+            torch.save(save_dict, os.path.join(checkpoint_dir, 'latest_checkpoint.pth'))
 
         # [DTSKD-PLOT] 将当前epoch指标写入CSV
         csv_writer.writerow([epoch,
