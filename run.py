@@ -179,7 +179,7 @@ sys.argv = [
     '--ce_weight', '1.0',
     '--kd_weight', '0.0',
     '--end_epoch', '200',
-    '--batch_size', '128',
+    '--batch_size', '4096',
     '--data_type', 'cifar100',
     '--classifier_type', 'resnet18_dtskd',
     '--data_path', data_root,
