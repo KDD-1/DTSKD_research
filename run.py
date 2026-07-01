@@ -169,48 +169,65 @@ if not found:
         print("Proceeding anyway (will fail if data missing)...")
 
 # ============================================================
-# 3. 配置实验参数
+# 3. 批量实验: 噪声梯度 30%~70%, hist vs ours
 # ============================================================
-sys.argv = [
-    'main.py',
-    '--experiments_name', 'noise50_ours_s27',
-    '--experiments_dir', output_dir,        # 输出到 OpenI output 目录
-    '--HSKD', '1',
-    '--ce_weight', '1.0',
-    '--kd_weight', '0.0',
-    '--end_epoch', '200',
-    '--batch_size', '4096',
-    '--data_type', 'cifar100',
-    '--classifier_type', 'resnet18_dtskd',
-    '--data_path', data_root,
-    '--workers', '8',
-    '--track_forgetting', '1',
-    '--random_seed', '27',
-    '--lr', '0.1',
-    '--lr_decay_schedule', '100', '150',
-    '--coeff_decay', 'cos',
-    '--cos_max', '0.9',
-    '--cos_min', '0.0',
-    '--alpha_end_epoch', '200',
-    '--noise_rate', '0.5',
-    '--af_lambda', '0.5',
-]
+experiments = []
+for noise_rate in [0.3, 0.4, 0.5, 0.6, 0.7]:
+    for method, af_lambda in [('hist', 0.0), ('ours', 0.5)]:
+        name = f'noise{int(noise_rate*100)}_{method}_s27'
+        experiments.append((name, noise_rate, af_lambda))
 
 print(f"\n{'=' * 60}")
-print(f"Args: {' '.join(sys.argv[1:])}")
+print(f"Batch experiments: {len(experiments)} runs")
+for name, nr, af in experiments:
+    print(f"  {name}  noise={nr}  af_lambda={af}")
 print(f"{'=' * 60}\n")
-sys.stdout.flush()
 
-# ============================================================
-# 4. 运行训练
-# ============================================================
-try:
-    with open('main.py', 'r', encoding='utf-8') as f:
-        code = compile(f.read(), 'main.py', 'exec')
-        exec(code, {'__name__': '__main__'})
-except Exception as e:
-    print(f"\nFATAL: {e}")
-    import traceback; traceback.print_exc()
+for exp_name, noise_rate, af_lambda in experiments:
+    print(f"\n{'#' * 60}")
+    print(f"# Running: {exp_name}")
+    print(f"{'#' * 60}")
+
+    sys.argv = [
+        'main.py',
+        '--experiments_name', exp_name,
+        '--experiments_dir', output_dir,
+        '--HSKD', '1',
+        '--ce_weight', '1.0',
+        '--kd_weight', '0.0',
+        '--end_epoch', '200',
+        '--batch_size', '4096',
+        '--data_type', 'cifar100',
+        '--classifier_type', 'resnet18_dtskd',
+        '--data_path', data_root,
+        '--workers', '8',
+        '--track_forgetting', '1',
+        '--random_seed', '27',
+        '--lr', '0.1',
+        '--lr_decay_schedule', '100', '150',
+        '--coeff_decay', 'cos',
+        '--cos_max', '0.9',
+        '--cos_min', '0.0',
+        '--alpha_end_epoch', '200',
+        '--noise_rate', str(noise_rate),
+        '--af_lambda', str(af_lambda),
+    ]
+
+    print(f"Args: {' '.join(sys.argv[1:])}")
+    sys.stdout.flush()
+
+    try:
+        with open('main.py', 'r', encoding='utf-8') as f:
+            code = compile(f.read(), 'main.py', 'exec')
+            exec(code, {'__name__': '__main__'})
+    except Exception as e:
+        print(f"\nFATAL in {exp_name}: {e}")
+        import traceback; traceback.print_exc()
+        print("Continuing to next experiment...")
+
+print("\n" + "=" * 60)
+print("ALL EXPERIMENTS DONE!")
+print("=" * 60)
 
 # ============================================================
 # 5. 上传结果
