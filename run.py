@@ -173,7 +173,7 @@ if not found:
 # ============================================================
 sys.argv = [
     'main.py',
-    '--experiments_name', 'noise50_hist_s27',
+    '--experiments_name', 'noise50_ours_s27',
     '--experiments_dir', output_dir,        # 输出到 OpenI output 目录
     '--HSKD', '1',
     '--ce_weight', '1.0',
@@ -193,6 +193,7 @@ sys.argv = [
     '--cos_min', '0.0',
     '--alpha_end_epoch', '200',
     '--noise_rate', '0.5',
+    '--af_lambda', '0.5',
 ]
 
 print(f"\n{'=' * 60}")
