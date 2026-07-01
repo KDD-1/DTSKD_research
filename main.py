@@ -24,7 +24,7 @@ from utils.label_dynamic import *
 #----------------------------------------------------
 #  Etc
 #----------------------------------------------------
-import os, logging
+import os, logging, time
 import argparse
 import numpy as np
 import csv  # [DTSKD-PLOT] 用于记录训练指标到CSV
@@ -382,6 +382,8 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
 
     for epoch in range(args.start_epoch, args.end_epoch):
 
+        epoch_start = time.time()
+
         # if args.tsne:
         out_list = []
         target_list = []
@@ -498,6 +500,11 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                              val_metrics['val_b1_top1'], val_metrics['val_b2_top1'], val_metrics['val_b3_top1'],
                              train_metrics['af_loss']])
         csv_file.flush()
+
+        epoch_time = time.time() - epoch_start
+        print(f"[Epoch {epoch} Timing] {epoch_time:.1f}s total")
+        if epoch == args.start_epoch:
+            print(f"[Estimate] ~{args.end_epoch * epoch_time / 3600:.1f} hours for {args.end_epoch} epochs at this speed")
 
         print(f"[Checkpoint Saved] Epoch {epoch}")
 

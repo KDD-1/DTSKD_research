@@ -25,48 +25,38 @@ last_time = time.time()
 begin_time = last_time
 
 
-def progress_bar(epoch,current, total, args, msg=None):
+def progress_bar(epoch, current, total, args, msg=None):
+    """Minimalist progress bar: one write() call, \r to overwrite.
+    Uses \n on the last batch so the final line is preserved in logs."""
     global last_time, begin_time
     if current == 0:
-        begin_time = time.time()  # Reset for new bar.
-
-    cur_len = int(TOTAL_BAR_LENGTH*current/total)
-    rest_len = int(TOTAL_BAR_LENGTH - cur_len) - 1
-    
-    C.yellow("Epoch: [{}]".format(epoch))
-    sys.stdout.write(C.cyan2("Epoch: [{}/{}]".format(epoch, (args.end_epoch - 1))))
-    sys.stdout.write(C.cyan2(' ['))
-    for i in range(cur_len):
-        sys.stdout.write(C.cyan2('='))
-    sys.stdout.write(C.cyan2('>'))
-    for i in range(rest_len):
-        sys.stdout.write('.')
-    sys.stdout.write(C.cyan2(']'))
+        begin_time = time.time()
 
     cur_time = time.time()
     step_time = cur_time - last_time
     last_time = cur_time
-    tot_time = cur_time - begin_time
 
-    L = []
-    L.append('  Step: %s' % format_time(step_time))
-    # L.append(' | Tot: %s' % format_time(tot_time))
+    # Build bar as a single string — one sys.stdout.write, one flush
+    bar_len = 30
+    filled = int(bar_len * (current + 1) / total)
+    bar = '=' * filled + '>' + '.' * (bar_len - filled - 1)
+
+    parts = [
+        f'\rEpoch [{epoch}/{args.end_epoch - 1}]',
+        f' [{bar}]',
+        f' {current + 1}/{total}',
+        f' Step: {format_time(step_time)}',
+    ]
     if msg:
-        L.append(' | ' + msg)
+        parts.append(f' | {msg}')
 
-    msg = ''.join(L)
-    sys.stdout.write(C.cyan2(msg))
-    for i in range(term_width-int(TOTAL_BAR_LENGTH)-len(msg)-3):
-        sys.stdout.write(' ')
+    line = ''.join(parts)
+    # Pad to clear any leftover chars from a previous longer line
+    if len(line) < term_width:
+        line += ' ' * (term_width - len(line))
 
-    # Go back to the center of the bar.
-    for i in range(term_width-int(TOTAL_BAR_LENGTH/2)+2):
-        sys.stdout.write('\b')
-    sys.stdout.write(C.cyan2(' %d/%d ' % (current+1, total)))
-
-    if current < total-1:
-        sys.stdout.write('\r')
-    else:
+    sys.stdout.write(line)
+    if current >= total - 1:
         sys.stdout.write('\n')
     sys.stdout.flush()
 

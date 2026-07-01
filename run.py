@@ -34,12 +34,23 @@ log_path = os.path.join(output_dir, 'debug_output.txt')
 log_file = open(log_path, 'w', encoding='utf-8')
 
 class Tee:
+    """Duplicate stdout/stderr to screen + log file.
+    Only flush on newline (or explicit flush) to avoid excessive disk I/O
+    from progress-bar writes that emit one character at a time."""
     def __init__(self, *files):
         self.files = files
+        self._buf = ''
     def write(self, s):
         for f in self.files:
             f.write(s)
-            f.flush()
+        # Only flush when a newline is emitted (line-buffered), or when the
+        # accumulated buffer grows large — avoids thousands of tiny disk writes
+        # triggered by the per-character ANSI progress bar.
+        self._buf += s
+        if '\n' in self._buf:
+            self._buf = self._buf.split('\n')[-1]
+            for f in self.files:
+                f.flush()
     def flush(self):
         for f in self.files:
             f.flush()
@@ -54,6 +65,43 @@ print(f"CWD: {os.getcwd()}")
 print(f"Python: {sys.version}")
 print(f"dataset_path: {dataset_base}")
 print(f"output_path: {output_dir}")
+
+# ============================================================
+# GPU 诊断
+# ============================================================
+print(f"\n{'=' * 60}")
+print("GPU Diagnostics")
+print(f"{'=' * 60}")
+try:
+    import torch
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"GPU count: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+            props = torch.cuda.get_device_properties(i)
+            print(f"    Memory: {props.total_memory / 1024**3:.1f} GB")
+            print(f"    Compute Capability: {props.major}.{props.minor}")
+        # quick speed test
+        print("Running GPU speed test (matrix multiply 4096x4096 x 100)...")
+        import time
+        x = torch.randn(4096, 4096, device='cuda')
+        y = torch.randn(4096, 4096, device='cuda')
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            z = torch.mm(x, y)
+        torch.cuda.synchronize()
+        elapsed = time.time() - t0
+        print(f"  GPU matmul: {elapsed:.3f}s (should be < 1s on A100)")
+    else:
+        print("*** WARNING: CUDA NOT AVAILABLE — will run on CPU! ***")
+        print("*** Check: pip list | grep torch ***")
+        print("*** You may have installed CPU-only PyTorch ***")
+except Exception as e:
+    print(f"GPU check failed: {e}")
 
 # ============================================================
 # 2. 适配 CIFAR-100 数据集
@@ -135,7 +183,7 @@ sys.argv = [
     '--data_type', 'cifar100',
     '--classifier_type', 'resnet18_dtskd',
     '--data_path', data_root,
-    '--workers', '4',
+    '--workers', '8',
     '--track_forgetting', '1',
     '--random_seed', '27',
     '--lr', '0.1',
