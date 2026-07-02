@@ -169,10 +169,11 @@ if not found:
         print("Proceeding anyway (will fail if data missing)...")
 
 # ============================================================
-# 3. 批量实验: 噪声梯度 30%~70%, hist vs ours
+# 3. 批量实验: 噪声梯度 20%~70%, hist vs ours
+#    LAMB + Linear LR scaling (bs=4096, base_bs=64 → lr=0.1×64=6.4)
 # ============================================================
 experiments = []
-for noise_rate in [0.3, 0.4, 0.5, 0.6, 0.7]:
+for noise_rate in [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]:
     for method, af_lambda in [('hist', 0.0), ('ours', 0.5)]:
         name = f'noise{int(noise_rate*100)}_{method}_s27'
         experiments.append((name, noise_rate, af_lambda))
@@ -211,6 +212,9 @@ for exp_name, noise_rate, af_lambda in experiments:
         '--alpha_end_epoch', '200',
         '--noise_rate', str(noise_rate),
         '--af_lambda', str(af_lambda),
+        '--optimizer', 'lamb',
+        '--lr_scaling', 'linear',
+        '--lr_scale_base_bs', '64',
     ]
 
     print(f"Args: {' '.join(sys.argv[1:])}")

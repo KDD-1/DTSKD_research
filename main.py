@@ -1,4 +1,5 @@
 from __future__ import print_function
+import math
 from math import log
 from xml.etree.ElementInclude import default_loader
 
@@ -96,6 +97,12 @@ def parse_args():
                         help='Anti-Forgetting SKD: neutral threshold (m_i=tau → w_i=1)')
     parser.add_argument('--noise_rate', type=float, default=0.0,
                         help='Symmetric label noise rate on training set (0.0 = clean, 0.2 = 20%%, 0.4 = 40%%)')
+    parser.add_argument('--optimizer', type=str, default='sgd', choices=['sgd', 'lamb'],
+                        help='Optimizer: sgd (Nesterov) or lamb (layer-wise adaptive)')
+    parser.add_argument('--lr_scaling', type=str, default='none', choices=['none', 'linear', 'sqrt'],
+                        help='LR scaling rule: none (use lr as-is), linear (lr * bs/bs_base), sqrt (lr * sqrt(bs/bs_base))')
+    parser.add_argument('--lr_scale_base_bs', type=int, default=64,
+                        help='Base batch size for LR scaling (default 64)')
     args = parser.parse_args()
     return check_args(args)
 
@@ -128,14 +135,25 @@ def get_freer_gpu():
 #----------------------------------------------------
 #  Adjust_learning_rate & get_learning_rate  
 #----------------------------------------------------
+def compute_effective_lr(args):
+    """Apply LR scaling rule based on batch_size vs base batch_size."""
+    if args.lr_scaling == 'linear':
+        scale = args.batch_size / args.lr_scale_base_bs
+    elif args.lr_scaling == 'sqrt':
+        scale = math.sqrt(args.batch_size / args.lr_scale_base_bs)
+    else:
+        scale = 1.0
+    return args.lr * scale
+
+
 def adjust_learning_rate(optimizer, epoch, args):
-    lr = args.lr
+    base_lr = getattr(args, '_effective_lr', args.lr)
 
     for milestone in args.lr_decay_schedule:
-        lr *= args.lr_decay_rate if epoch >= milestone else 1.
-        
+        base_lr *= args.lr_decay_rate if epoch >= milestone else 1.
+
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group['lr'] = base_lr
 
         
 def get_learning_rate(optimizer):
@@ -272,14 +290,35 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
     else:
         criterion_CE_hskd = None
         criterion_KD_hskd = None
-    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=True)
+    # --- LR scaling (applied once, before decay schedule) ---
+    args._effective_lr = compute_effective_lr(args)
+    print(C.underline(C.yellow("[Info] Base LR: {}, Scaling: {}, Effective LR: {:.6f}".format(
+        args.lr, args.lr_scaling, args._effective_lr))))
+
+    # --- Optimizer selection ---
+    if args.optimizer == 'lamb':
+        optimizer = LAMB(net.parameters(), lr=args._effective_lr,
+                         betas=(0.9, 0.999), eps=1e-6,
+                         weight_decay=args.weight_decay)
+        print(C.green("[!] Using LAMB optimizer"))
+    else:
+        optimizer = torch.optim.SGD(net.parameters(), lr=args._effective_lr,
+                                    momentum=0.9, weight_decay=args.weight_decay,
+                                    nesterov=True)
+        print(C.green("[!] Using SGD optimizer (Nesterov)"))
+
     # resume
     if args.resume != '':
 
         checkpoint = torch.load(args.resume, map_location='cuda')
 
         net.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # LAMB state dict keys differ from SGD; skip optimizer load if mismatch to avoid crash
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(C.red2(f"[Warn] Cannot load optimizer state (optimizer type mismatch?): {e}"))
+            print(C.red2("[Warn] Continuing with fresh optimizer state."))
 
         args.start_epoch = checkpoint['epoch'] + 1
 
@@ -340,7 +379,10 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         alpha_t = checkpoint['alpha_t'] if 'alpha_t' in checkpoint else 0.9
         best_acc = checkpoint['best_acc']
         net.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(C.red2(f"[Warn] Cannot load optimizer state (optimizer type mismatch?): {e}"))
         # [FIX] 恢复HSKD历史预测矩阵
         if args.HSKD and 'all_predictions' in checkpoint:
             all_predictions = checkpoint['all_predictions'].cpu()
@@ -514,6 +556,84 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
 
 
 from torch.cuda.amp import GradScaler as GradScaler
+
+# ============================================================
+# LAMB Optimizer (Layer-wise Adaptive Moments for Batch training)
+# Ref: You et al., "Large Batch Optimization for Deep Learning", ICLR 2020
+# ============================================================
+class LAMB(torch.optim.Optimizer):
+    """LAMB optimizer with decoupled weight decay and layer-wise adaptive LR."""
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6,
+                 weight_decay=0.0, adam_mode=False):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.adam_mode = adam_mode
+        super(LAMB, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('LAMB does not support sparse gradients')
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                t = state['step']
+
+                # Decay the first and second moment running averages
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Bias correction
+                bias_correction1 = 1 - beta1 ** t
+                bias_correction2 = 1 - beta2 ** t
+
+                # Adam update (decoupled weight decay is applied later via trust ratio)
+                step_size = group['lr']
+                if not group['weight_decay']:
+                    step_size /= bias_correction1
+                adam_step = exp_avg / bias_correction1
+                adam_step.div_(exp_avg_sq.sqrt().div_(bias_correction2 ** 0.5).add_(group['eps']))
+
+                # Weight decay (decoupled, AdamW-style)
+                if group['weight_decay']:
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+
+                # Trust ratio: r = ||p|| / ||adam_step||
+                weight_norm = p.norm(2)
+                adam_norm = adam_step.norm(2)
+
+                if weight_norm > 0 and adam_norm > 0:
+                    trust_ratio = weight_norm / adam_norm
+                else:
+                    trust_ratio = 1.0
+
+                if self.adam_mode:
+                    trust_ratio = 1.0
+
+                # Update
+                p.add_(adam_step, alpha=-step_size * trust_ratio)
+
+        return loss
 
 # ============================================================
 # EWC (Elastic Weight Consolidation) for SKD
