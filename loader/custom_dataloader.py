@@ -110,7 +110,7 @@ def dataloader(args):
                                                    shuffle=(train_sampler is None),
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
 
         valid_loader = torch.utils.data.DataLoader(validset, pin_memory=True,
                                                    batch_size=args.batch_size,
@@ -118,7 +118,7 @@ def dataloader(args):
                                                    shuffle=False,
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
 
     elif args.data_type == 'cifar100':
 
@@ -167,14 +167,14 @@ def dataloader(args):
                                                    shuffle=(train_sampler is None),
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
 
         valid_loader = torch.utils.data.DataLoader(validset, pin_memory=True,
                                                    batch_size=args.batch_size,
                                                    sampler=None, shuffle=False,
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
     
     elif args.data_type == 'imagenet':
         mean=[0.485, 0.456, 0.406]
@@ -220,7 +220,7 @@ def dataloader(args):
                                                    shuffle=(train_sampler is None),
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
 
         valid_loader = torch.utils.data.DataLoader(validset,
                                                    pin_memory=True,
@@ -229,7 +229,7 @@ def dataloader(args):
                                                    shuffle=False,
                                                    num_workers=args.workers,
                                                    persistent_workers=(args.workers > 0),
-                                                   prefetch_factor=2)
+                                                   prefetch_factor=2 if args.workers > 0 else None)
     
     else:
         raise Exception("[!] There is no option for Datatype")    

@@ -1,0 +1,20 @@
+| 项目         	| 内容          
+| ---------- 	| ----------- 
+| Paper     		| DTSKD       
+| Dataset    	| CIFAR100    
+| Backbone   	| ResNet18    
+| Epoch      	| 50/300      
+| Best Top1  	| 56.23       
+| Best Epoch 	| 32          
+| Final Top1 	| 33.32       
+| 是否复现成功  	| 否           
+| 原因分析       	| a_t衰减过快，模型更新参数完全依赖历史KD，导致CE无法纠正预测值
+
+
+发现：(超参数敏感) DTSKD 的性能高度依赖历史教师权重 α_t 的衰减策略。原论文使用 300 epoch 训练，当训练周期缩短到 50 epoch 时，直接采用相同的 cosine schedule 会导致 α_t 过快衰减，使模型在自身KD准确率不高的情况下过度依赖KD，从而出现性能退化。
+ α_t → 0
+    → soft_targets = 模型自己的预测（可能本来就是错的）
+    → L_his 强化这些错误
+    → Backbone 在 L_his + L_stru 双重作用下，漂移到一个自洽但错误的状态
+    → 分支在 80% L_stru 权重下，学习这个退化 backbone
+    → 正反馈循环：错误 backbone → 错误分支 → 错误预测 → 下一轮软目标更差

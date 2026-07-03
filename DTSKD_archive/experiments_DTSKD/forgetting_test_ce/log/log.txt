@@ -1,0 +1,11 @@
+[2026-06-24 00:06:06,165] [main] Namespace(lr=0.1, lr_decay_rate=0.1, lr_decay_schedule=[150, 225], weight_decay=0.0005, start_epoch=0, end_epoch=5, backbone_weight=3.0, b1_weight=1.0, b2_weight=1.0, b3_weight=1.0, ce_weight=1.0, kd_weight=0.0, coeff_decay='linear', cos_max=1.0, cos_min=0.0, HSKD=0, batch_size=64, experiments_dir='./experiments', experiments_name='forgetting_test_ce', classifier_type='resnet18_dtskd', data_path='./data', data_type='cifar100', alpha_T=0.8, alpha_end_epoch=-1, saveckp_freq=299, rank=-1, world_size=1, dist_backend='nccl', dist_url='tcp://127.0.0.1:8080', workers=0, multiprocessing_distributed=False, resume='', random_seed=27, tsne=0, track_forgetting=1, distributed=False, ngpus_per_node=1, gpu=0)
+[2026-06-24 00:07:04,943] [train] [Rank -1] [Epoch 0] [HSKD 0] [lr 1.0e-01] [alpht_t -1.000] [train_loss 4.098] [train_top1_acc 6.674] [train_top5_acc 23.646]
+[2026-06-24 00:07:08,971] [val] [Epoch 0] [val_top1_acc 11.160] [val_top5_acc 33.510] [val_b1_acc 0.900] [val_b2_acc 0.920] [val_b3_acc 1.320]
+[2026-06-24 00:08:05,386] [train] [Rank -1] [Epoch 1] [HSKD 0] [lr 1.0e-01] [alpht_t -1.000] [train_loss 3.469] [train_top1_acc 16.278] [train_top5_acc 42.842]
+[2026-06-24 00:08:09,602] [val] [Epoch 1] [val_top1_acc 19.960] [val_top5_acc 47.990] [val_b1_acc 0.730] [val_b2_acc 0.860] [val_b3_acc 0.790]
+[2026-06-24 00:09:08,939] [train] [Rank -1] [Epoch 2] [HSKD 0] [lr 1.0e-01] [alpht_t -1.000] [train_loss 3.047] [train_top1_acc 23.958] [train_top5_acc 54.182]
+[2026-06-24 00:09:13,118] [val] [Epoch 2] [val_top1_acc 26.300] [val_top5_acc 55.690] [val_b1_acc 0.910] [val_b2_acc 1.330] [val_b3_acc 0.790]
+[2026-06-24 00:10:12,864] [train] [Rank -1] [Epoch 3] [HSKD 0] [lr 1.0e-01] [alpht_t -1.000] [train_loss 2.707] [train_top1_acc 30.870] [train_top5_acc 62.832]
+[2026-06-24 00:10:17,116] [val] [Epoch 3] [val_top1_acc 31.800] [val_top5_acc 62.980] [val_b1_acc 1.030] [val_b2_acc 1.060] [val_b3_acc 0.970]
+[2026-06-24 00:11:16,653] [train] [Rank -1] [Epoch 4] [HSKD 0] [lr 1.0e-01] [alpht_t -1.000] [train_loss 2.353] [train_top1_acc 37.940] [train_top5_acc 70.548]
+[2026-06-24 00:11:20,984] [val] [Epoch 4] [val_top1_acc 36.410] [val_top5_acc 67.420] [val_b1_acc 0.830] [val_b2_acc 1.090] [val_b3_acc 1.070]

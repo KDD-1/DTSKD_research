@@ -9,7 +9,14 @@ venv/
 # Data & Experiments (large files)
 data/
 experiments/
+*.pth
 tempsave100/
+
+# Checkpoints (large binary files)
+*.pth
+
+# Office temp files
+~$*
 
 # PDFs
 *.pdf

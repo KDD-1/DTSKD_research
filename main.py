@@ -1,10 +1,7 @@
 from __future__ import print_function
 import math
-from math import log
-from xml.etree.ElementInclude import default_loader
 
 import torch
-from torch._C import device
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
@@ -13,22 +10,20 @@ import torch.utils.data.distributed
 import torch.distributed as dist
 
 from loader import custom_dataloader
-
 from models.network import get_network
-
 from utils.dir_maker import DirectroyMaker
 from utils.AverageMeter import AverageMeter
 from utils.color import Colorer
 from utils.etc import progress_bar, is_main_process, save_on_master, paser_config_save, set_logging_defaults
 from utils.label_dynamic import *
+from regularization import MCW_AF, EWCRegularizer
+from optim import LAMB
 
-#----------------------------------------------------
-#  Etc
-#----------------------------------------------------
 import os, logging, time
 import argparse
 import numpy as np
-import csv  # [DTSKD-PLOT] 用于记录训练指标到CSV
+import csv
+from torch.cuda.amp import GradScaler, autocast
 
 
 #----------------------------------------------------
@@ -350,16 +345,12 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         b2_predictions = None
         b3_predictions = None
 
-    # [MCW-AF v3] Per-sample prediction stability (EMA of correctness)
-    # stability[i] ≈ 样本 i 最近被正确分类的频率
-    # 用于自适应 AF 强度: 稳定样本强保护, 振荡样本弱/不保护
-    if args.HSKD and args.af_lambda > 0.0:
-        if args.resume != '' and 'stability' in checkpoint:
-            stability = checkpoint['stability'].cpu()
-        else:
-            stability = torch.zeros(len(train_loader.dataset), dtype=torch.float32)
-    else:
-        stability = None
+    # [TrainerState] 封装训练器状态 (scaler, EWC, MCW-AF)
+    trainer_state = TrainerState()
+    trainer_state.init_regularizers(args, len(train_loader.dataset))
+
+    # backward-compat: stability 别名 (MCW-AF 内部管理)
+    stability = trainer_state.mcw_af.stability if trainer_state.mcw_af is not None else None
 
     #----------------------------------------------------
     #  load status & Resume Learning
@@ -389,6 +380,13 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
             b1_predictions = checkpoint['b1_predictions'].cpu()
             b2_predictions = checkpoint['b2_predictions'].cpu()
             b3_predictions = checkpoint['b3_predictions'].cpu()
+        # Restore regularizer state
+        if 'trainer_state' in checkpoint:
+            ts = checkpoint['trainer_state']
+            if trainer_state.mcw_af is not None and 'mcw_af' in ts:
+                trainer_state.mcw_af.load_state_dict(ts['mcw_af'])
+            if trainer_state.ewc is not None and 'ewc' in ts:
+                trainer_state.ewc.load_state_dict(ts['ewc'])
         print(C.green("[!] [Rank {}] Model loaded".format(args.rank)))
 
         del checkpoint
@@ -419,8 +417,6 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
         forgetting_dir = os.path.join(log_dir, 'forgetting')
         os.makedirs(forgetting_dir, exist_ok=True)
 
-    # [EWC] 初始化: 第一个 epoch 后, 用当前参数作为参考点 θ*
-    global _ewc_ref_params, _ewc_fisher
 
     for epoch in range(args.start_epoch, args.end_epoch):
 
@@ -465,7 +461,8 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                                 epoch,
                                 alpha_t,
                                 train_loader,
-                                args)
+                                args,
+                                trainer_state)
 
         # dist.barrier()
         if args.track_forgetting:
@@ -489,19 +486,11 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                       out_list,
                       target_list,
                       args)
-        # ===== [EWC] 更新 Fisher 信息和参考参数 =====
-        if args.ewc_lambda > 0 and args.track_forgetting:
-            update_interval = max(1, args.ewc_freq)
-            if epoch % update_interval == 0 and epoch >= args.ewc_freq:
-                # 用当前正确分类的验证集样本计算 Fisher
-                correct_indices = per_sample_correct.nonzero(as_tuple=True)[0]
-                if len(correct_indices) > 0:
-                    _ewc_fisher = compute_ewc_fisher(
-                        net, valid_loader, criterion_CE, args,
-                        num_samples=min(2000, len(correct_indices)))
-                    _ewc_ref_params = update_ewc_ref(net)
-                    print(f'[EWC] Updated Fisher & Ref Params at epoch {epoch} '
-                          f'(on {len(correct_indices)} correct samples)')
+        # ── EWC: epoch-end Fisher 更新 ──
+        if trainer_state.ewc is not None and args.track_forgetting:
+            trainer_state.ewc.on_epoch_end(
+                net, valid_loader, criterion_CE, args,
+                per_sample_correct, epoch)
 
         # ===== 仅最后一个 epoch 保存 checkpoint 到输出目录 =====
         if epoch == args.end_epoch - 1:
@@ -520,8 +509,14 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
                 save_dict['b1_predictions'] = b1_predictions
                 save_dict['b2_predictions'] = b2_predictions
                 save_dict['b3_predictions'] = b3_predictions
-            if stability is not None:
-                save_dict['stability'] = stability
+            # Save regularizer states for resume
+            ts = {}
+            if trainer_state.mcw_af is not None:
+                ts['mcw_af'] = trainer_state.mcw_af.state_dict()
+            if trainer_state.ewc is not None:
+                ts['ewc'] = trainer_state.ewc.state_dict()
+            if ts:
+                save_dict['trainer_state'] = ts
             torch.save(save_dict, os.path.join(checkpoint_dir, 'latest_checkpoint.pth'))
 
         # [DTSKD-PLOT] 将当前epoch指标写入CSV
@@ -555,170 +550,26 @@ def main_worker(gpu,ngpus_per_node,model_dir,log_dir,args):
     print(C.green("[!] [Rank {}] Distroy Distributed process".format(args.rank)))
 
 
-from torch.cuda.amp import GradScaler as GradScaler
-
 # ============================================================
-# LAMB Optimizer (Layer-wise Adaptive Moments for Batch training)
-# Ref: You et al., "Large Batch Optimization for Deep Learning", ICLR 2020
+# 训练器状态容器 (替代全局变量和 18 参数 train())
 # ============================================================
-class LAMB(torch.optim.Optimizer):
-    """LAMB optimizer with decoupled weight decay and layer-wise adaptive LR."""
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6,
-                 weight_decay=0.0, adam_mode=False):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if weight_decay < 0.0:
-            raise ValueError(f"Invalid weight_decay: {weight_decay}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        self.adam_mode = adam_mode
-        super(LAMB, self).__init__(params, defaults)
+class TrainerState:
+    """封装训练过程中可变状态，替代全局变量和冗长参数列表。"""
+    def __init__(self):
+        self.scaler = GradScaler()
+        self.ewc: 'EWCRegularizer | None' = None
+        self.mcw_af: 'MCW_AF | None' = None
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+    def init_regularizers(self, args, num_train_samples):
+        if args.ewc_lambda > 0:
+            self.ewc = EWCRegularizer(ewc_lambda=args.ewc_lambda,
+                                      ewc_freq=args.ewc_freq)
+        if args.HSKD and args.af_lambda > 0.0:
+            self.mcw_af = MCW_AF(af_lambda=args.af_lambda,
+                                 af_alpha=args.af_alpha,
+                                 af_tau=args.af_tau,
+                                 num_samples=num_train_samples)
 
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError('LAMB does not support sparse gradients')
-
-                state = self.state[p]
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p)
-                    state['exp_avg_sq'] = torch.zeros_like(p)
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
-                state['step'] += 1
-                t = state['step']
-
-                # Decay the first and second moment running averages
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                # Bias correction
-                bias_correction1 = 1 - beta1 ** t
-                bias_correction2 = 1 - beta2 ** t
-
-                # Adam update (decoupled weight decay is applied later via trust ratio)
-                step_size = group['lr']
-                if not group['weight_decay']:
-                    step_size /= bias_correction1
-                adam_step = exp_avg / bias_correction1
-                adam_step.div_(exp_avg_sq.sqrt().div_(bias_correction2 ** 0.5).add_(group['eps']))
-
-                # Weight decay (decoupled, AdamW-style)
-                if group['weight_decay']:
-                    p.mul_(1 - group['lr'] * group['weight_decay'])
-
-                # Trust ratio: r = ||p|| / ||adam_step||
-                weight_norm = p.norm(2)
-                adam_norm = adam_step.norm(2)
-
-                if weight_norm > 0 and adam_norm > 0:
-                    trust_ratio = weight_norm / adam_norm
-                else:
-                    trust_ratio = 1.0
-
-                if self.adam_mode:
-                    trust_ratio = 1.0
-
-                # Update
-                p.add_(adam_step, alpha=-step_size * trust_ratio)
-
-        return loss
-
-# ============================================================
-# EWC (Elastic Weight Consolidation) for SKD
-# ============================================================
-def compute_ewc_fisher(net, dataloader, criterion_ce, args, num_samples=2000):
-    """
-    计算 Fisher 信息矩阵对角线，仅对当前正确分类的样本。
-
-    数学: F_i = E_x[(∂L_CE/∂θ_i)^2]
-    仅对 ŷ(x) == y 的样本计算，保护"已知正确知识"不被遗忘。
-
-    返回: {name: fisher_diagonal_tensor}
-    """
-    net.eval()
-    fisher = {}
-    for name, param in net.named_parameters():
-        fisher[name] = torch.zeros_like(param)
-
-    count = 0
-    for inputs, targets, _ in dataloader:
-        if count >= num_samples:
-            break
-        if args.gpu is not None:
-            inputs = inputs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-
-        net.zero_grad()
-        outputs, _, _, _ = net(inputs)
-        loss = criterion_ce(outputs, targets)
-        loss.backward()
-
-        # 只累积正确分类样本的 Fisher
-        _, predicted = outputs.max(1)
-        correct_mask = (predicted == targets).float()
-
-        for name, param in net.named_parameters():
-            if param.grad is not None:
-                # F_i += (∂L/∂θ_i)^2，对正确样本加权
-                grad_sq = param.grad.data ** 2
-                # 按样本平均（简化：用 batch 内正确样本比例缩放）
-                weight = correct_mask.mean()
-                fisher[name] += grad_sq * weight
-
-        count += inputs.size(0)
-
-    # 归一化
-    for name in fisher:
-        fisher[name] /= max(count / inputs.size(0), 1)  # 按 batch 数平均
-
-    net.train()
-    return fisher
-
-
-def ewc_loss(net, fisher, ref_params, args):
-    """
-    计算 EWC 正则化损失。
-
-    L_EWC = (λ/2) * Σ_i F_i * (θ_i - θ_i*)^2
-
-    使用教师置信度加权: λ_eff = λ * max_c p_t(c|x)
-    """
-    if args.ewc_lambda <= 0 or not fisher:
-        return torch.tensor(0.0).cuda()
-
-    loss = 0.0
-    for name, param in net.named_parameters():
-        if name in fisher and name in ref_params:
-            loss += (fisher[name] * (param - ref_params[name]) ** 2).sum()
-
-    return 0.5 * args.ewc_lambda * loss
-
-
-def update_ewc_ref(net):
-    """保存当前参数作为 EWC 参考点 θ*"""
-    ref = {}
-    for name, param in net.named_parameters():
-        ref[name] = param.data.clone()
-    return ref
-from torch.cuda.amp import autocast as autocast
-
-scaler = GradScaler()
-
-# EWC 全局状态 (避免修改 train() 函数签名)
-_ewc_ref_params = {}
-_ewc_fisher = {}
 
 def train(all_predictions,
         b1_predictions,
@@ -734,7 +585,8 @@ def train(all_predictions,
           epoch,
           alpha_t,
           train_loader,
-          args):
+          args,
+          trainer_state):
     
     train_top1 = AverageMeter()
     train_top5 = AverageMeter()
@@ -859,52 +711,24 @@ def train(all_predictions,
         # =====================================================================
         loss = args.ce_weight * loss_ce + args.kd_weight * loss_kd
 
-        # =====================================================================
-        # [Anti-Forgetting SKD] 置信度加权的输出空间 KL 约束
-        # 核心: 边际置信度 m_i = p_old(y_i) - max_{c≠y_i} p_old(c)
-        #       m_i ≤ 0 → w_i = 0 (抽奖机制, 完全放弃错误历史知识)
-        #       m_i > 0 → w_i = exp(α·(m_i-τ)) (指数型动态权重, 保护高置信度正确知识)
-        #       KL(p_old || p_new) 强制新分布覆盖旧分布的高概率区域
-        # =====================================================================
-        if args.HSKD and args.af_lambda > 0.0 and epoch > 0:
-            # [v3] 更新 per-sample 预测稳定性 (正确分类的 EMA)
-            with torch.no_grad():
-                correct_mask = (softmax_output.argmax(dim=1) == targets).float().cpu()
-                stability[input_indices] = 0.9 * stability[input_indices] + 0.1 * correct_mask
-                stab_batch = stability[input_indices].cuda()
+        # ── MCW-AF: 置信度加权抗遗忘 ──
+        if trainer_state.mcw_af is not None:
+            loss_af = trainer_state.mcw_af.compute_loss(
+                softmax_output=softmax_output,
+                targets=targets,
+                input_indices=input_indices,
+                all_predictions=all_predictions,
+                alpha_t=alpha_t,
+                epoch=epoch)
+            if loss_af is not None:
+                loss = loss + loss_af
+                train_af_losses.update(loss_af.item(), inputs.size(0))
 
-                p_old_batch = all_predictions[input_indices].cuda()
-                # 式(1): 边际置信度 — 识别"可靠知识"与"噪声"
-                p_old_correct = p_old_batch[torch.arange(p_old_batch.size(0)), targets]
-                p_old_masked = p_old_batch.clone()
-                p_old_masked[torch.arange(p_old_masked.size(0)), targets] = -float('inf')
-                p_old_max_wrong = p_old_masked.max(dim=1).values
-                m = p_old_correct - p_old_max_wrong
-                # 式(2): 动态连续权重 — "抽奖机制" (m_i≤0→0) + 指数型映射 (m_i>0)
-                w = torch.where(
-                    m > 0,
-                    torch.exp(args.af_alpha * (m - args.af_tau)),
-                    torch.zeros_like(m)
-                )
-
-            # 前向 KL: KL(p_old || p_new) — 用旧分布"检查"新分布
-            log_p_new = torch.log(softmax_output + 1e-10)
-            kl_per_sample = F.kl_div(log_p_new, p_old_batch, reduction='none').sum(dim=1)
-
-            # 式(3): 加权 KL 均值
-            # [v3] w_i 乘 stability_i: 只有稳定正确+高边际置信度的样本才获强保护
-            # (1-α_t) 全局调度: 早期弱(自由探索), 后期强(巩固保护)
-            af_weights = args.af_lambda * (1.0 - alpha_t) * stab_batch * w
-            loss_af = (af_weights * kl_per_sample).mean()
-            loss = loss + loss_af
-            train_af_losses.update(loss_af.item(), inputs.size(0))
-
-        # [EWC] 弹性权重巩固正则化: L_EWC = (λ/2) * Σ F_i * (θ_i - θ_i*)^2
-        if args.ewc_lambda > 0 and _ewc_ref_params and _ewc_fisher:
-            loss_ewc = 0.0
-            for name, param in net.named_parameters():
-                if name in _ewc_fisher and name in _ewc_ref_params:
-                    loss_ewc += (_ewc_fisher[name] * (param - _ewc_ref_params[name]) ** 2).sum()
+        # ── EWC: 弹性权重巩固 ──
+        if trainer_state.ewc is not None:
+            loss_ewc = trainer_state.ewc.compute_loss(net)
+            if loss_ewc is not None:
+                loss = loss + loss_ewc
             loss = loss + 0.5 * args.ewc_lambda * loss_ewc
 
         train_losses.update(loss.item(), inputs.size(0))
@@ -914,9 +738,9 @@ def train(all_predictions,
         train_top5.update(err5.item(), inputs.size(0))
 
         # compute gradient and do SGD step
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        trainer_state.scaler.scale(loss).backward()
+        trainer_state.scaler.step(optimizer)
+        trainer_state.scaler.update()
 
         # =====================================================================
         # [DTSKD-核心] 更新历史预测矩阵 (用于下一轮的软目标生成)
@@ -943,7 +767,7 @@ def train(all_predictions,
         t_gpu += t2 - t1  # time from data-ready to end of GPU+update
         t0 = t2  # start timing next data-load wait
 
-        af_info = ' | af_loss: {:.3f} (stab={:.2f})'.format(train_af_losses.avg, stability.mean().item()) if args.af_lambda > 0 else ''
+        af_info = ' | af_loss: {:.3f} (stab={:.2f})'.format(train_af_losses.avg, trainer_state.mcw_af.mean_stability) if trainer_state.mcw_af is not None else ''
         progress_bar(epoch,batch_idx, len(train_loader),args, 'lr: {:.1e} | alpha_t: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f}{}'.format(
             current_LR, alpha_t, train_top1.avg, train_top5.avg, af_info))
 
@@ -962,7 +786,7 @@ def train(all_predictions,
         'top5': train_top5.avg,
         'lr': current_LR,
         'alpha_t': alpha_t,
-        'af_loss': train_af_losses.avg if args.af_lambda > 0 else 0.0
+        'af_loss': train_af_losses.avg if trainer_state.mcw_af is not None else 0.0
     }
     return all_predictions, b1_predictions, b2_predictions, b3_predictions, stability, train_metrics
 
